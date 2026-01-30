@@ -1,5 +1,4 @@
--- WARNING: This schema is for context only and is not meant to be run.
--- Table order and constraints may not be valid for execution.
+-- WARNING: This schema was tested with Supabase, so it might not work when running off platform. 
 
 CREATE TABLE public.documents (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
