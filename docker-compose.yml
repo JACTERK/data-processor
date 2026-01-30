@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  data-processor:
+    build: .
+    container_name: data-processor
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      - PORT=${PORT:-8080}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+    # Load environment variables from a .env file if present
+    env_file:
+      - .env
+    restart: unless-stopped
