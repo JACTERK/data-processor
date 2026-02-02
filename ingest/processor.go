@@ -106,18 +106,14 @@ func (p *Processor) ProcessJob(ctx context.Context, job *db.IngestJob) error {
 func (p *Processor) ProcessSinglePage(ctx context.Context, client *notionapi.Client, page *notionapi.Page, tenantID, notionDBID string) error {
 	log.Printf("Syncing page %s", page.ID)
 
-	// Fetch full blocks to get content?
-	// For simple ingestion, we often just want the flattened text of the page.
-	// We need to traverse blocks.
-
 	// Helper to get text content from blocks
-	content, err := p.getPageContent(ctx, client, page.ID.String())
+	snippets, err := p.getPageContent(ctx, client, page.ID.String())
 	if err != nil {
 		return err
 	}
 
-	if content == "" {
-		// Skip empty pages? or store empty?
+	if len(snippets) == 0 {
+		// Skip empty pages
 		return nil
 	}
 
@@ -135,35 +131,34 @@ func (p *Processor) ProcessSinglePage(ctx context.Context, client *notionapi.Cli
 	}
 
 	// Chunk Data
-	chunks, err := chunkText(content, p.ChunkSize, p.ChunkOverlap)
+	chunks, err := chunkSnippets(snippets, p.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("failed to chunk text: %w", err)
 	}
 
 	var docs []*db.Document
 
-	for i, chunkContent := range chunks {
+	for i, chunk := range chunks {
 		// Generate Embedding for chunk
-		embedding, err := p.LLM.GenerateEmbedding(ctx, chunkContent)
+		embedding, err := p.LLM.GenerateEmbedding(ctx, chunk.Content)
 		if err != nil {
 			return err
 		}
 
 		// Construct Document
 		doc := &db.Document{
-			Content:   chunkContent,
+			Content:   chunk.Content,
 			Embedding: embedding,
 			TenantID:  tenantID,
 			Metadata: map[string]interface{}{
-				"notion_page_id": page.ID.String(),
-				"notion_db":      notionDBID, // This is our UUID or External? Ideally our UUID if passed from DB.
-				// The webhook passes External ID if we don't map it.
-				// But Processor expects what? It writes it to metadata.
+				"notion_page_id":   page.ID.String(),
+				"notion_db":        notionDBID,
 				"last_edited_time": page.LastEditedTime,
 				"url":              page.URL,
 				"title":            title,
 				"chunk_index":      i,
 				"total_chunks":     len(chunks),
+				"anchor_block_id":  chunk.AnchorBlockID,
 			},
 		}
 		docs = append(docs, doc)
@@ -172,42 +167,103 @@ func (p *Processor) ProcessSinglePage(ctx context.Context, client *notionapi.Cli
 	return p.DB.ReplacePageDocuments(ctx, tenantID, page.ID.String(), notionDBID, docs)
 }
 
-func chunkText(text string, chunkSize, chunkOverlap int) ([]string, error) {
-	// Use cl100k_base encoding (common for OpenAI models like text-embedding-3-small)
+type Chunk struct {
+	Content       string
+	AnchorBlockID string
+}
+
+type Snippet struct {
+	Text    string
+	BlockID string
+}
+
+func chunkSnippets(snippets []Snippet, chunkSize int) ([]Chunk, error) {
 	tkm, err := tiktoken.GetEncoding("cl100k_base")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get encoding: %w", err)
 	}
 
-	tokens := tkm.Encode(text, nil, nil)
+	var chunks []Chunk
+	var currentChunkSnippets []Snippet
+	currentTokens := 0
 
-	if chunkSize <= 0 || len(tokens) <= chunkSize {
-		return []string{text}, nil
-	}
+	for _, snippet := range snippets {
+		snippetTokens := len(tkm.Encode(snippet.Text, nil, nil))
 
-	var chunks []string
-	step := chunkSize - chunkOverlap
-	if step <= 0 {
-		step = chunkSize // Prevent infinite loop or negative step
-	}
+		// If single snippet is larger than chunk size, we must split it
+		if snippetTokens > chunkSize {
+			// First, flush any accumulated snippets
+			if len(currentChunkSnippets) > 0 {
+				chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
+				currentChunkSnippets = []Snippet{}
+				currentTokens = 0
+			}
 
-	for i := 0; i < len(tokens); i += step {
-		end := i + chunkSize
-		if end > len(tokens) {
-			end = len(tokens)
+			// Now split the large snippet
+			// We split the distinct text but keep the SAME BlockID for all parts
+			// This ensures deep linking works (landing on the big block)
+			text := snippet.Text
+			for len(tkm.Encode(text, nil, nil)) > chunkSize {
+				fullTokens := tkm.Encode(text, nil, nil)
+
+				// Take first chunkSize tokens
+				chunkTokens := fullTokens[:chunkSize]
+				chunkText := tkm.Decode(chunkTokens)
+
+				chunks = append(chunks, Chunk{
+					Content:       chunkText,
+					AnchorBlockID: snippet.BlockID,
+				})
+
+				// Remaining
+				remainingTokens := fullTokens[chunkSize:]
+				text = tkm.Decode(remainingTokens)
+			}
+			// Add remainder
+			if text != "" {
+				currentChunkSnippets = append(currentChunkSnippets, Snippet{Text: text, BlockID: snippet.BlockID})
+				currentTokens = len(tkm.Encode(text, nil, nil))
+			}
+			continue
 		}
 
-		chunkTokens := tokens[i:end]
-		chunkText := tkm.Decode(chunkTokens)
-		chunks = append(chunks, chunkText)
+		// Normal processing
+		if currentTokens+snippetTokens > chunkSize {
+			chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
+			currentChunkSnippets = []Snippet{}
+			currentTokens = 0
+		}
+
+		currentChunkSnippets = append(currentChunkSnippets, snippet)
+		currentTokens += snippetTokens
 	}
+
+	// Flush remaining
+	if len(currentChunkSnippets) > 0 {
+		chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
+	}
+
 	return chunks, nil
 }
 
-func (p *Processor) getPageContent(ctx context.Context, client *notionapi.Client, pageID string) (string, error) {
+func createChunkFromSnippets(snippets []Snippet) Chunk {
+	if len(snippets) == 0 {
+		return Chunk{}
+	}
+	var content string
+	for _, s := range snippets {
+		content += s.Text + "\n"
+	}
+	return Chunk{
+		Content:       content,
+		AnchorBlockID: snippets[0].BlockID,
+	}
+}
+
+func (p *Processor) getPageContent(ctx context.Context, client *notionapi.Client, pageID string) ([]Snippet, error) {
 	// Simple block traversal - retrieve children
 	// Handling pagination for blocks too!
-	var content string
+	var snippets []Snippet
 	hasMore := true
 	var startCursor notionapi.Cursor
 
@@ -219,32 +275,30 @@ func (p *Processor) getPageContent(ctx context.Context, client *notionapi.Client
 
 		children, err := client.Block.GetChildren(ctx, notionapi.BlockID(pageID), req)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		for _, block := range children.Results {
 			// Extract text from common block types
 			text := extractTextFromBlock(block)
 			if text != "" {
-				content += text + "\n"
+				snippets = append(snippets, Snippet{
+					Text:    text,
+					BlockID: block.GetID().String(),
+				})
 			}
-
-			// Recursion logic simplified/removed to avoid interface issues conform 'jomei/notionapi'.
-			// If strictly needed, checking HasChildren requires type assertion to specific block structs
-			// that support it, as existing 'Block' interface might not expose it in this version.
-			// For now, we skip recursion to ensure build stability.
 		}
 
 		hasMore = children.HasMore
 		startCursor = notionapi.Cursor(children.NextCursor)
 	}
 
-	return content, nil
+	return snippets, nil
 }
 
 func extractTextFromBlock(block notionapi.Block) string {
 	// Simplified extraction for common types
-	// Using type switch
+	// Add more types as needed
 	switch b := block.(type) {
 	case *notionapi.ParagraphBlock:
 		return richTextToString(b.Paragraph.RichText)
@@ -260,7 +314,8 @@ func extractTextFromBlock(block notionapi.Block) string {
 		return richTextToString(b.NumberedListItem.RichText)
 	case *notionapi.ToDoBlock:
 		return richTextToString(b.ToDo.RichText)
-	// Add more types as needed
+	case *notionapi.CalloutBlock:
+		return richTextToString(b.Callout.RichText)
 	default:
 		return ""
 	}
