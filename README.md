@@ -8,6 +8,7 @@ A robust Go service designed to process data for RAG (Retrieval-Augmented Genera
 - **LLM Integration**: Uses OpenAI API for generating embeddings and processing text.
 - **Webhook Support**: Optional webhook server for external integrations.
 - **Configurable**: Fully configurable via environment variables.
+- **Deep Linking Support**: Implements Block-Aligned Chunking for precise notion block linking.
 
 ## Prerequisites
 
@@ -40,8 +41,8 @@ A robust Go service designed to process data for RAG (Retrieval-Augmented Genera
     | ---------------------- | --------------------------------------------------------------------------- | ------- |
     | `DB_CONNECTION_STRING` | The connection URL for your PostgreSQL database.                            | -       |
     | `OPENAI_API_KEY`       | Your OpenAI API Key (starts with `sk-...`).                                 | -       |
-    | `CHUNK_SIZE`           | The maximum character size for text chunks.                                 | `1000`  |
-    | `CHUNK_OVERLAP`        | The number of characters to overlap between chunks.                         | `200`   |
+    | `CHUNK_SIZE`           | The maximum token size for text chunks (block-aligned).                     | `300`   |
+    | `CHUNK_OVERLAP`        | The number of tokens to overlap (set to 0 for block alignment).             | `0`     |
     | `PORT`                 | The port for the webhook server.                                            | `9992`  |
     | `WEBHOOK_SECRET`       | A secret key for securing incoming webhooks.                                | `secret`|
 
