@@ -26,8 +26,8 @@ func LoadConfig() *Config {
 	return &Config{
 		DBConnectionString: getEnv("DB_CONNECTION_STRING", ""),
 		OpenAIKey:          getEnv("OPENAI_API_KEY", ""),
-		ChunkSize:          getEnvInt("CHUNK_SIZE", 1000),
-		ChunkOverlap:       getEnvInt("CHUNK_OVERLAP", 200),
+		ChunkSize:          getEnvInt("CHUNK_SIZE", 300),
+		ChunkOverlap:       getEnvInt("CHUNK_OVERLAP", 0),
 		Port:               getEnv("PORT", "8080"),
 		WebhookSecret:      getEnv("WEBHOOK_SECRET", ""),
 	}
