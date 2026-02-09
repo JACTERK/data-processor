@@ -37,7 +37,7 @@ func main() {
 	llmClient := llm.NewClient(cfg.OpenAIKey)
 
 	// 4. Initialize Processor
-	processor := ingest.NewProcessor(database, llmClient, cfg.ChunkSize, cfg.ChunkOverlap)
+	processor := ingest.NewProcessor(database, llmClient, cfg.ChunkSize, cfg.ChunkOverlap, cfg.ChildMinTokens, cfg.ChildMaxTokens)
 
 	// 5. Start Webhook Server (Optional if secret/port set?)
 	// We'll start it always, as it handles webhooks if configured.

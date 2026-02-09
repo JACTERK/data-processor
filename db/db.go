@@ -18,6 +18,7 @@ type DB struct {
 type IngestJob struct {
 	ID           string
 	NotionDB     string
+	TenantID     string
 	Status       string
 	ErrorMessage string
 	UpdatedAt    time.Time
@@ -38,6 +39,13 @@ type Document struct {
 	Embedding []float32
 	TenantID  string
 	CreatedAt time.Time
+	DocType   string // "parent" or "child"
+	ParentID  string // UUID of parent doc (children only)
+}
+
+type ParentWithChildren struct {
+	Parent   *Document
+	Children []*Document
 }
 
 func NewDB(connString string) (*DB, error) {
@@ -73,8 +81,8 @@ func (db *DB) GetNextJob(ctx context.Context) (*IngestJob, error) {
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, notion_db, status, updated_at
-	`).Scan(&job.ID, &job.NotionDB, &job.Status, &job.UpdatedAt)
+		RETURNING id, notion_db, tenant_id, status, updated_at
+	`).Scan(&job.ID, &job.NotionDB, &job.TenantID, &job.Status, &job.UpdatedAt)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -129,7 +137,7 @@ func (db *DB) GetExistingPageMap(ctx context.Context, tenantID, notionDBID strin
 	rows, err := db.Pool.Query(ctx, `
 		SELECT metadata->>'notion_page_id', (metadata->>'last_edited_time')::timestamp
 		FROM documents
-		WHERE tenant_id = $1 AND metadata->>'notion_db' = $2
+		WHERE tenant_id = $1 AND metadata->>'notion_db' = $2 AND doc_type = 'parent'
 	`, tenantID, notionDBID)
 	if err != nil {
 		return nil, err
@@ -152,35 +160,54 @@ func (db *DB) GetExistingPageMap(ctx context.Context, tenantID, notionDBID strin
 	return pageMap, nil
 }
 
-func (db *DB) ReplacePageDocuments(ctx context.Context, tenantID, notionPageID, notionDBID string, docs []*Document) error {
+func (db *DB) ReplacePageDocuments(ctx context.Context, tenantID, notionPageID, notionDBID string, groups []ParentWithChildren) error {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
-	// 1. Delete existing documents for this page
+	// 1. Delete existing documents for this page (covers both parents and children)
 	_, err = tx.Exec(ctx, `
-		DELETE FROM documents 
+		DELETE FROM documents
 		WHERE tenant_id = $1 AND metadata->>'notion_page_id' = $2
 	`, tenantID, notionPageID)
 	if err != nil {
 		return err
 	}
 
-	// 2. Insert new documents (chunks)
-	for _, doc := range docs {
-		metaJSON, err := json.Marshal(doc.Metadata)
+	// 2. Insert parent-child groups
+	for _, group := range groups {
+		// Insert parent (no embedding)
+		parentMetaJSON, err := json.Marshal(group.Parent.Metadata)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.Exec(ctx, `
-			INSERT INTO documents (content, metadata, embedding, tenant_id)
-			VALUES ($1, $2, $3, $4)
-		`, doc.Content, metaJSON, pgvectorFormat(doc.Embedding), tenantID)
+		var parentID string
+		err = tx.QueryRow(ctx, `
+			INSERT INTO documents (content, metadata, embedding, tenant_id, doc_type)
+			VALUES ($1, $2, NULL, $3, 'parent')
+			RETURNING id
+		`, group.Parent.Content, parentMetaJSON, tenantID).Scan(&parentID)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to insert parent document: %w", err)
+		}
+
+		// Insert children referencing the parent
+		for _, child := range group.Children {
+			childMetaJSON, err := json.Marshal(child.Metadata)
+			if err != nil {
+				return err
+			}
+
+			_, err = tx.Exec(ctx, `
+				INSERT INTO documents (content, metadata, embedding, tenant_id, doc_type, parent_id)
+				VALUES ($1, $2, $3, $4, 'child', $5)
+			`, child.Content, childMetaJSON, pgvectorFormat(child.Embedding), tenantID, parentID)
+			if err != nil {
+				return fmt.Errorf("failed to insert child document: %w", err)
+			}
 		}
 	}
 

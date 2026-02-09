@@ -13,6 +13,8 @@ type Config struct {
 	OpenAIKey          string
 	ChunkSize          int
 	ChunkOverlap       int
+	ChildMinTokens     int
+	ChildMaxTokens     int
 	Port               string
 	WebhookSecret      string
 }
@@ -28,6 +30,8 @@ func LoadConfig() *Config {
 		OpenAIKey:          getEnv("OPENAI_API_KEY", ""),
 		ChunkSize:          getEnvInt("CHUNK_SIZE", 300),
 		ChunkOverlap:       getEnvInt("CHUNK_OVERLAP", 0),
+		ChildMinTokens:     getEnvInt("CHILD_MIN_TOKENS", 15),
+		ChildMaxTokens:     getEnvInt("CHILD_MAX_TOKENS", 150),
 		Port:               getEnv("PORT", "8080"),
 		WebhookSecret:      getEnv("WEBHOOK_SECRET", ""),
 	}

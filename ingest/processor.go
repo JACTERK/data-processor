@@ -12,18 +12,22 @@ import (
 )
 
 type Processor struct {
-	DB           *db.DB
-	LLM          *llm.Client
-	ChunkSize    int
-	ChunkOverlap int
+	DB             *db.DB
+	LLM            *llm.Client
+	ChunkSize      int
+	ChunkOverlap   int
+	ChildMinTokens int
+	ChildMaxTokens int
 }
 
-func NewProcessor(database *db.DB, llmClient *llm.Client, chunkSize, chunkOverlap int) *Processor {
+func NewProcessor(database *db.DB, llmClient *llm.Client, chunkSize, chunkOverlap, childMinTokens, childMaxTokens int) *Processor {
 	return &Processor{
-		DB:           database,
-		LLM:          llmClient,
-		ChunkSize:    chunkSize,
-		ChunkOverlap: chunkOverlap,
+		DB:             database,
+		LLM:            llmClient,
+		ChunkSize:      chunkSize,
+		ChunkOverlap:   chunkOverlap,
+		ChildMinTokens: childMinTokens,
+		ChildMaxTokens: childMaxTokens,
 	}
 }
 
@@ -106,50 +110,56 @@ func (p *Processor) ProcessJob(ctx context.Context, job *db.IngestJob) error {
 func (p *Processor) ProcessSinglePage(ctx context.Context, client *notionapi.Client, page *notionapi.Page, tenantID, notionDBID string) error {
 	log.Printf("Syncing page %s", page.ID)
 
-	// Helper to get text content from blocks
 	snippets, err := p.getPageContent(ctx, client, page.ID.String())
 	if err != nil {
 		return err
 	}
 
 	if len(snippets) == 0 {
-		// Skip empty pages
 		return nil
 	}
 
-	// Extract Title and URL
+	// Extract Title
 	title := "Untitled"
 	if props, ok := page.Properties["Name"].(*notionapi.TitleProperty); ok {
 		if len(props.Title) > 0 {
 			title = props.Title[0].PlainText
 		}
 	} else if props, ok := page.Properties["title"].(*notionapi.TitleProperty); ok {
-		// Some DBs use lowercase 'title'
 		if len(props.Title) > 0 {
 			title = props.Title[0].PlainText
 		}
 	}
 
-	// Chunk Data
-	chunks, err := chunkSnippets(snippets, p.ChunkSize)
+	// Chunk into parents with children
+	parents, err := chunkSnippets(snippets, p.ChunkSize, p.ChildMinTokens, p.ChildMaxTokens)
 	if err != nil {
 		return fmt.Errorf("failed to chunk text: %w", err)
 	}
 
-	var docs []*db.Document
-
-	for i, chunk := range chunks {
-		// Generate Embedding for chunk
-		embedding, err := p.LLM.GenerateEmbedding(ctx, chunk.Content)
-		if err != nil {
-			return err
+	// Collect all child texts for batch embedding
+	var allChildTexts []string
+	for _, parent := range parents {
+		for _, child := range parent.Children {
+			allChildTexts = append(allChildTexts, child.Content)
 		}
+	}
 
-		// Construct Document
-		doc := &db.Document{
-			Content:   chunk.Content,
-			Embedding: embedding,
-			TenantID:  tenantID,
+	// Generate embeddings in one batch
+	embeddings, err := p.LLM.GenerateEmbeddings(ctx, allChildTexts)
+	if err != nil {
+		return fmt.Errorf("failed to generate embeddings: %w", err)
+	}
+
+	// Build parent-child document groups
+	var groups []db.ParentWithChildren
+	embIdx := 0
+
+	for i, parent := range parents {
+		parentDoc := &db.Document{
+			Content:  parent.Content,
+			TenantID: tenantID,
+			DocType:  "parent",
 			Metadata: map[string]interface{}{
 				"notion_page_id":   page.ID.String(),
 				"notion_db":        notionDBID,
@@ -157,17 +167,46 @@ func (p *Processor) ProcessSinglePage(ctx context.Context, client *notionapi.Cli
 				"url":              page.URL,
 				"title":            title,
 				"chunk_index":      i,
-				"total_chunks":     len(chunks),
-				"anchor_block_id":  chunk.AnchorBlockID,
+				"total_chunks":     len(parents),
 			},
 		}
-		docs = append(docs, doc)
+
+		var childDocs []*db.Document
+		for j, child := range parent.Children {
+			childDoc := &db.Document{
+				Content:   child.Content,
+				Embedding: embeddings[embIdx],
+				TenantID:  tenantID,
+				DocType:   "child",
+				Metadata: map[string]interface{}{
+					"notion_page_id":     page.ID.String(),
+					"notion_db":          notionDBID,
+					"last_edited_time":   page.LastEditedTime,
+					"url":                page.URL,
+					"title":              title,
+					"parent_chunk_index": i,
+					"child_chunk_index":  j,
+					"anchor_block_id":    child.AnchorBlockID,
+				},
+			}
+			childDocs = append(childDocs, childDoc)
+			embIdx++
+		}
+
+		groups = append(groups, db.ParentWithChildren{Parent: parentDoc, Children: childDocs})
 	}
 
-	return p.DB.ReplacePageDocuments(ctx, tenantID, page.ID.String(), notionDBID, docs)
+	return p.DB.ReplacePageDocuments(ctx, tenantID, page.ID.String(), notionDBID, groups)
 }
 
-type Chunk struct {
+type ParentChunk struct {
+	Content       string
+	AnchorBlockID string
+	Snippets      []Snippet
+	Children      []ChildChunk
+}
+
+type ChildChunk struct {
 	Content       string
 	AnchorBlockID string
 }
@@ -177,87 +216,178 @@ type Snippet struct {
 	BlockID string
 }
 
-func chunkSnippets(snippets []Snippet, chunkSize int) ([]Chunk, error) {
+// chunkSnippets produces parent chunks (for LLM context) each containing
+// child chunks (for vector search + accurate deep linking).
+func chunkSnippets(snippets []Snippet, parentSize, minChildTokens, maxChildTokens int) ([]ParentChunk, error) {
+	parents, err := chunkSnippetsIntoParents(snippets, parentSize)
+	if err != nil {
+		return nil, err
+	}
+	for i := range parents {
+		if err := splitParentIntoChildren(&parents[i], minChildTokens, maxChildTokens); err != nil {
+			return nil, err
+		}
+	}
+	return parents, nil
+}
+
+// chunkSnippetsIntoParents groups snippets into parent-sized chunks (~300 tokens),
+// retaining the source snippets on each parent for later child generation.
+func chunkSnippetsIntoParents(snippets []Snippet, parentSize int) ([]ParentChunk, error) {
 	tkm, err := tiktoken.GetEncoding("cl100k_base")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get encoding: %w", err)
 	}
 
-	var chunks []Chunk
-	var currentChunkSnippets []Snippet
+	var parents []ParentChunk
+	var currentSnippets []Snippet
 	currentTokens := 0
 
 	for _, snippet := range snippets {
 		snippetTokens := len(tkm.Encode(snippet.Text, nil, nil))
 
-		// If single snippet is larger than chunk size, we must split it
-		if snippetTokens > chunkSize {
-			// First, flush any accumulated snippets
-			if len(currentChunkSnippets) > 0 {
-				chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
-				currentChunkSnippets = []Snippet{}
+		// If single snippet is larger than parent size, split it
+		if snippetTokens > parentSize {
+			// Flush accumulated snippets
+			if len(currentSnippets) > 0 {
+				parents = append(parents, createParentChunkFromSnippets(currentSnippets))
+				currentSnippets = nil
 				currentTokens = 0
 			}
 
-			// Now split the large snippet
-			// We split the distinct text but keep the SAME BlockID for all parts
-			// This ensures deep linking works (landing on the big block)
+			// Split the large snippet, keeping the same BlockID
 			text := snippet.Text
-			for len(tkm.Encode(text, nil, nil)) > chunkSize {
+			for len(tkm.Encode(text, nil, nil)) > parentSize {
 				fullTokens := tkm.Encode(text, nil, nil)
-
-				// Take first chunkSize tokens
-				chunkTokens := fullTokens[:chunkSize]
+				chunkTokens := fullTokens[:parentSize]
 				chunkText := tkm.Decode(chunkTokens)
 
-				chunks = append(chunks, Chunk{
-					Content:       chunkText,
-					AnchorBlockID: snippet.BlockID,
-				})
+				splitSnippet := Snippet{Text: chunkText, BlockID: snippet.BlockID}
+				parents = append(parents, createParentChunkFromSnippets([]Snippet{splitSnippet}))
 
-				// Remaining
-				remainingTokens := fullTokens[chunkSize:]
+				remainingTokens := fullTokens[parentSize:]
 				text = tkm.Decode(remainingTokens)
 			}
-			// Add remainder
+			// Add remainder to accumulator
 			if text != "" {
-				currentChunkSnippets = append(currentChunkSnippets, Snippet{Text: text, BlockID: snippet.BlockID})
+				currentSnippets = append(currentSnippets, Snippet{Text: text, BlockID: snippet.BlockID})
 				currentTokens = len(tkm.Encode(text, nil, nil))
 			}
 			continue
 		}
 
-		// Normal processing
-		if currentTokens+snippetTokens > chunkSize {
-			chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
-			currentChunkSnippets = []Snippet{}
+		// Normal: flush if adding this snippet would exceed parent size
+		if currentTokens+snippetTokens > parentSize {
+			parents = append(parents, createParentChunkFromSnippets(currentSnippets))
+			currentSnippets = nil
 			currentTokens = 0
 		}
 
-		currentChunkSnippets = append(currentChunkSnippets, snippet)
+		currentSnippets = append(currentSnippets, snippet)
 		currentTokens += snippetTokens
 	}
 
-	// Flush remaining
-	if len(currentChunkSnippets) > 0 {
-		chunks = append(chunks, createChunkFromSnippets(currentChunkSnippets))
+	if len(currentSnippets) > 0 {
+		parents = append(parents, createParentChunkFromSnippets(currentSnippets))
 	}
 
-	return chunks, nil
+	return parents, nil
 }
 
-func createChunkFromSnippets(snippets []Snippet) Chunk {
+func createParentChunkFromSnippets(snippets []Snippet) ParentChunk {
 	if len(snippets) == 0 {
-		return Chunk{}
+		return ParentChunk{}
 	}
 	var content string
 	for _, s := range snippets {
 		content += s.Text + "\n"
 	}
-	return Chunk{
+	return ParentChunk{
 		Content:       content,
 		AnchorBlockID: snippets[0].BlockID,
+		Snippets:      snippets,
 	}
+}
+
+// splitParentIntoChildren produces child chunks from a parent's snippets using
+// a hybrid block-level strategy:
+//   - Each block (snippet) becomes its own child by default
+//   - Tiny blocks (< minTokens) are merged with the next block
+//   - Large blocks (> maxTokens) are split at token boundaries
+func splitParentIntoChildren(parent *ParentChunk, minTokens, maxTokens int) error {
+	tkm, err := tiktoken.GetEncoding("cl100k_base")
+	if err != nil {
+		return fmt.Errorf("failed to get encoding: %w", err)
+	}
+
+	var children []ChildChunk
+	var accSnippets []Snippet
+	accTokens := 0
+
+	flushAcc := func() {
+		if len(accSnippets) == 0 {
+			return
+		}
+		var content string
+		for _, s := range accSnippets {
+			content += s.Text + "\n"
+		}
+		children = append(children, ChildChunk{
+			Content:       content,
+			AnchorBlockID: accSnippets[0].BlockID,
+		})
+		accSnippets = nil
+		accTokens = 0
+	}
+
+	for _, snippet := range parent.Snippets {
+		snippetTokens := len(tkm.Encode(snippet.Text, nil, nil))
+
+		// Large block: flush accumulator, then split the block
+		if snippetTokens > maxTokens {
+			flushAcc()
+
+			text := snippet.Text
+			for len(tkm.Encode(text, nil, nil)) > maxTokens {
+				fullTokens := tkm.Encode(text, nil, nil)
+				chunkText := tkm.Decode(fullTokens[:maxTokens])
+				children = append(children, ChildChunk{
+					Content:       chunkText,
+					AnchorBlockID: snippet.BlockID,
+				})
+				text = tkm.Decode(fullTokens[maxTokens:])
+			}
+			if text != "" {
+				accSnippets = append(accSnippets, Snippet{Text: text, BlockID: snippet.BlockID})
+				accTokens = len(tkm.Encode(text, nil, nil))
+			}
+			continue
+		}
+
+		// Tiny block: accumulate with neighbors
+		if snippetTokens < minTokens {
+			accSnippets = append(accSnippets, snippet)
+			accTokens += snippetTokens
+			// If accumulated enough, flush
+			if accTokens >= minTokens {
+				flushAcc()
+			}
+			continue
+		}
+
+		// Normal-sized block: flush any accumulated tiny blocks, then emit this block as its own child
+		flushAcc()
+		children = append(children, ChildChunk{
+			Content:       snippet.Text + "\n",
+			AnchorBlockID: snippet.BlockID,
+		})
+	}
+
+	// Flush remaining accumulated snippets
+	flushAcc()
+
+	parent.Children = children
+	return nil
 }
 
 func (p *Processor) getPageContent(ctx context.Context, client *notionapi.Client, pageID string) ([]Snippet, error) {
